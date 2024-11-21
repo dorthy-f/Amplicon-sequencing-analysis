@@ -1,0 +1,128 @@
+---
+title: "Generating table for downstream amplicon sequencing mutational analysis"
+Author/version: Dorthy Fang, 11/21/2024
+---
+
+```{r}
+# Load necessary libraries
+library(Biostrings)
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+#BiocManager::install("Rsamtools")
+library(Rsamtools)
+library(dplyr)
+
+# Load the reference sequence
+# Define your DNA sequence
+dna_sequence <- DNAString("CAAGTATCTTCGATTCAACTGTCCAACAAAGTCCACCAATATGATGGGTCACCGGGTTGATTATTTTATTGCTTCAAAAGCAGTGGACTGTCTTTTGGATTCAAAGTGGGCAAAGGCCAAGAAAGGAGAGGAAGCTTTATTTACAACCAGG")  # Replace with your full DNA sequence
+
+# Convert the DNAString to a DNAStringSet and add a name
+dna_sequence <- DNAStringSet(dna_sequence)
+names(dna_sequence) <- "reference"  # Set the FASTA header name
+
+# Write to a .fasta file, which will be used to align your fastq.gz files
+writeXStringSet(dna_sequence, filepath = "/vast/palmer/scratch/nachtergaele/df555/amplicon_seq/reference_Cell_SEC62.fasta")
+
+#STOP HERE: and run your alignment with bwa in the cluster
+
+```
+
+This chunk requires you to have already run your alignment and have your sorted bam file generated from your fastq.gz files. 
+```{r}
+
+reference_fasta <- "/vast/palmer/scratch/nachtergaele/df555/amplicon_seq/reference_Cell_SEC62.fasta" 
+reference_seq <- readDNAStringSet(reference_fasta)[[1]]  # Assumes single-sequence FASTA file
+reference_seq_str <- as.character(reference_seq)
+
+# Step 2: Process the BAM file in R to extract and annotate sequences
+
+# Load BAM file 
+bamfile <- "/vast/palmer/scratch/nachtergaele/df555/amplicon_seq/sorted_output1Q.bam"                   
+param <- ScanBamParam(what = c("seq", "cigar"))
+alignments <- scanBam(bamfile, param = param)
+
+#This code can check that the alignments worked correctly
+#str(alignments[[1]])
+#length(alignments[[1]]$seq) == length(alignments[[1]]$cigar)
+
+# Function to annotate differences between each aligned sequence and the reference sequence
+annotate_sequence <- function(target_seq, reference_seq, cigar) {
+  target_str <- ""
+  ref_pos <- 1
+  target_pos <- 1
+  
+  # Split CIGAR string into operations
+  ops <- gregexpr("[0-9]+[MIDNSHPX=]", cigar, perl = TRUE)
+  matches <- regmatches(cigar, ops)[[1]]
+
+  for (op in matches) {
+    count <- as.numeric(sub("[A-Z]", "", op))
+    op_type <- sub("[0-9]+", "", op)
+
+    if (op_type == "M" || op_type == "=") {
+      # Match or alignment match
+      for (i in 1:count) {
+        target_base <- substring(target_seq, target_pos, target_pos)
+        ref_base <- substring(reference_seq, ref_pos, ref_pos)
+        
+        if (target_base == ref_base) {
+          target_str <- paste0(target_str, ref_base)
+        } else {
+          target_str <- paste0(target_str, target_base)  # Mismatch
+        }
+        ref_pos <- ref_pos + 1
+        target_pos <- target_pos + 1
+      }
+    } else if (op_type == "I") {
+      # Insertion
+      insertion <- substring(target_seq, target_pos, target_pos + count - 1)
+      target_str <- paste0(target_str, tolower(insertion))
+      target_pos <- target_pos + count
+    } else if (op_type == "D") {
+      # Deletion
+      deletion <- strrep("-", count)
+      target_str <- paste0(target_str, deletion)
+      ref_pos <- ref_pos + count
+    } else if (op_type == "S" || op_type == "H") {
+      # Soft/Hard clipping
+      target_pos <- target_pos + count
+    }
+  }
+  
+  return(target_str)
+}
+
+# Extract and annotate each sequence in the BAM file - this step can take a long time
+annotated_seqs <- mapply(
+  annotate_sequence,
+  target_seq = as.character(alignments[[1]]$seq),
+  cigar = alignments[[1]]$cigar,
+  MoreArgs = list(reference_seq = reference_seq_str)
+)
+
+# Step 3: Summarize the results and calculate read percentages
+result_table <- data.frame(TargetSequence = annotated_seqs) %>%
+  group_by(TargetSequence) %>%
+  summarise(
+    Reads = n(),
+    Pct = (Reads / length(annotated_seqs)) * 100
+  )
+
+# Add WideReference column with the full reference sequence
+result_table$WideReference <- reference_seq_str
+
+#Filter table for only those that match your primers for starting/ending - I use my primer sequences (in the forward direction) + a 5 bp overhang to rule out primer dimers
+start_string <- "CAAGTATCTTCGATTCAACTGTCCAACA"
+end_string <- "GGAGAGGAAGCTTTATTTACAACCAGG"
+
+# Filter rows where column1 starts with 'start' and ends with 'end'
+filtered_df <- result_table[grepl(paste0("^", start_string), result_table$TargetSequence) & 
+                  grepl(paste0(end_string, "$"), result_table$TargetSequence), ]
+
+# Recalculate the Pct column based on the filtered reads
+filtered_df$Pct <- (filtered_df$Reads / sum(filtered_df$Reads)) * 100
+
+# Export results, for furhter analysis
+write.csv(filtered_df,"/vast/palmer/scratch/nachtergaele/df555/amplicon_seq/test_1Q.csv", row.names = TRUE)
+```
+
